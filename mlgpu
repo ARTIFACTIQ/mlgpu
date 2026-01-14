@@ -1,0 +1,494 @@
+#!/bin/bash
+# ╔═══════════════════════════════════════════════════════════════════════════════╗
+# ║  mlgpu - Apple Silicon GPU Monitor for ML Training                            ║
+# ║  https://github.com/artifactiq/mlgpu                                          ║
+# ║  MIT License - Copyright (c) 2026 Artifactiq                                  ║
+# ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+VERSION="1.0.0"
+W=80  # Fixed width
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Arguments
+# ─────────────────────────────────────────────────────────────────────────────────
+TOTAL=100000
+PROJECT_ARG=""
+PYTORCH_LOG=""
+HF_LOG=""
+JSON_MODE=false
+ONCE_MODE=false
+
+show_help() {
+    cat << EOF
+mlgpu v${VERSION} - Apple Silicon GPU Monitor for ML Training
+
+USAGE:
+    mlgpu [OPTIONS]
+
+OPTIONS:
+    -i, --iterations NUM    Total training iterations (default: 100000)
+    -p, --project PATH      Path to Create ML .mlproj directory
+    -l, --log PATH          Path to PyTorch/training log file
+    --hf PATH               Path to HuggingFace Trainer output directory
+    -j, --json              Output single JSON snapshot and exit
+    -1, --once              Display once and exit (no refresh)
+    -r, --reset             Reset timer and cached stats
+    -v, --version           Show version
+    -h, --help              Show this help
+
+EXAMPLES:
+    # Auto-detect Create ML project
+    mlgpu
+
+    # Monitor PyTorch training
+    mlgpu -l ./runs/train.log -i 50000
+
+    # Monitor HuggingFace Trainer
+    mlgpu --hf ./output/
+
+    # Get JSON snapshot for scripting
+    mlgpu --json | jq '.gpu.device_util'
+
+    # Specify Create ML project
+    mlgpu -p ~/Projects/MyModel.mlproj
+
+SUPPORTED TRAINING FRAMEWORKS:
+    - Apple Create ML (auto-detection)
+    - PyTorch (via log file)
+    - HuggingFace Trainer (via output dir)
+    - Ultralytics YOLO (via log file)
+    - Manual input (echo "iter|loss" > /tmp/mlgpu_state)
+
+More info: https://github.com/artifactiq/mlgpu
+EOF
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -i|--iterations) TOTAL="$2"; shift 2 ;;
+        -p|--project) PROJECT_ARG="$2"; shift 2 ;;
+        -l|--log) PYTORCH_LOG="$2"; shift 2 ;;
+        --hf) HF_LOG="$2"; shift 2 ;;
+        -j|--json) JSON_MODE=true; shift ;;
+        -1|--once) ONCE_MODE=true; shift ;;
+        -r|--reset) rm -f /tmp/mlgpu_*; echo "Reset complete"; exit 0 ;;
+        -v|--version) echo "mlgpu v${VERSION}"; exit 0 ;;
+        -h|--help) show_help ;;
+        *) shift ;;
+    esac
+done
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Colors (disabled for JSON mode)
+# ─────────────────────────────────────────────────────────────────────────────────
+if [ "$JSON_MODE" = true ]; then
+    RST="" BLD="" DIM="" BBLK="" BRED="" BGRN="" BYEL="" BBLU="" BMAG="" BCYN="" BWHT="" BGBLU=""
+else
+    RST=$'\033[0m'
+    BLD=$'\033[1m'
+    DIM=$'\033[2m'
+    BBLK=$'\033[90m'
+    BRED=$'\033[91m'
+    BGRN=$'\033[92m'
+    BYEL=$'\033[93m'
+    BBLU=$'\033[94m'
+    BMAG=$'\033[95m'
+    BCYN=$'\033[96m'
+    BWHT=$'\033[97m'
+    BGBLU=$'\033[44m'
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# State files
+# ─────────────────────────────────────────────────────────────────────────────────
+STATE="/tmp/mlgpu_state"
+START="/tmp/mlgpu_start"
+BEST="/tmp/mlgpu_best"
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Find training data source
+# ─────────────────────────────────────────────────────────────────────────────────
+MLPROJ=""
+DATA_SOURCE="manual"
+
+find_createml_project() {
+    local proj=""
+    if [ -n "$PROJECT_ARG" ]; then
+        [ -d "$PROJECT_ARG" ] && proj="$PROJECT_ARG"
+    else
+        proj=$(find ~/src ~/Projects ~/Documents -name "*.mlproj" -type d 2>/dev/null | head -1)
+    fi
+    if [ -n "$proj" ]; then
+        local container=$(find "$proj" -path "*/Model Containers/*.json" -type f 2>/dev/null | head -1)
+        [ -n "$container" ] && echo "$container"
+    fi
+}
+
+MLPROJ=$(find_createml_project)
+[ -n "$MLPROJ" ] && DATA_SOURCE="createml"
+[ -n "$PYTORCH_LOG" ] && DATA_SOURCE="pytorch"
+[ -n "$HF_LOG" ] && DATA_SOURCE="huggingface"
+
+[ ! -f "$START" ] && date +%s > "$START"
+[ ! -f "$BEST" ] && echo "999" > "$BEST"
+
+# Terminal setup (skip for JSON mode)
+if [ "$JSON_MODE" = false ]; then
+    tput civis 2>/dev/null
+    trap 'tput cnorm 2>/dev/null; tput sgr0; echo; exit 0' INT TERM EXIT
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Helper Functions
+# ─────────────────────────────────────────────────────────────────────────────────
+fmt_time() { printf "%02d:%02d:%02d" $(($1/3600)) $((($1%3600)/60)) $(($1%60)); }
+
+bar() {
+    local pct=$1 w=$2 style=$3
+    local filled=$((pct * w / 100))
+    local empty=$((w - filled))
+    local out="${BBLK}▐"
+
+    case $style in
+        gpu)
+            for ((i=0; i<filled; i++)); do
+                local p=$((i * 100 / w))
+                if [ $p -lt 50 ]; then out+="${BGRN}█"
+                elif [ $p -lt 75 ]; then out+="${BYEL}█"
+                else out+="${BRED}█"; fi
+            done ;;
+        train) for ((i=0; i<filled; i++)); do out+="${BCYN}█"; done ;;
+        mem)
+            local c="${BBLU}"; [ $pct -ge 60 ] && c="${BMAG}"; [ $pct -ge 85 ] && c="${BRED}"
+            for ((i=0; i<filled; i++)); do out+="${c}█"; done ;;
+        loss)
+            local c="${BGRN}"; [ $pct -ge 30 ] && c="${BYEL}"; [ $pct -ge 60 ] && c="${BRED}"
+            for ((i=0; i<filled; i++)); do out+="${c}▓"; done ;;
+    esac
+    out+="${BBLK}"
+    for ((i=0; i<empty; i++)); do out+="░"; done
+    echo -n "${out}▌${RST}"
+}
+
+pct_c() {
+    local v=$1
+    if [ $v -lt 50 ]; then echo -n "${BGRN}"
+    elif [ $v -lt 80 ]; then echo -n "${BYEL}"
+    else echo -n "${BRED}"; fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Data Collection
+# ─────────────────────────────────────────────────────────────────────────────────
+collect() {
+    # GPU Stats from ioreg
+    local s=$(ioreg -l 2>/dev/null | grep "PerformanceStatistics" | head -1)
+    GPU_D=$(echo "$s" | grep -o '"Device Utilization %"=[0-9]*' | cut -d= -f2)
+    GPU_R=$(echo "$s" | grep -o '"Renderer Utilization %"=[0-9]*' | cut -d= -f2)
+    GPU_T=$(echo "$s" | grep -o '"Tiler Utilization %"=[0-9]*' | cut -d= -f2)
+    MEM_U=$(echo "$s" | grep -o '"In use system memory"=[0-9]*' | cut -d= -f2)
+    MEM_A=$(echo "$s" | grep -o '"Alloc system memory"=[0-9]*' | cut -d= -f2)
+
+    GPU_D=${GPU_D:-0}; GPU_R=${GPU_R:-0}; GPU_T=${GPU_T:-0}
+    MEM_U=${MEM_U:-0}; MEM_A=${MEM_A:-0}
+
+    MEM_U_GB=$(awk "BEGIN {printf \"%.2f\", $MEM_U/1073741824}")
+    MEM_A_GB=$(awk "BEGIN {printf \"%.2f\", $MEM_A/1073741824}")
+    MEM_U_I=$((MEM_U / 1073741824))
+    MEM_A_I=$((MEM_A / 1073741824))
+    [ $MEM_A_I -eq 0 ] && MEM_A_I=1
+
+    # Training State - from various sources
+    ITER=0; LOSS="--"
+
+    case $DATA_SOURCE in
+        createml)
+            if [ -n "$MLPROJ" ] && [ -f "$MLPROJ" ]; then
+                local metrics=$(python3 -c "
+import json
+try:
+    with open('$MLPROJ') as f:
+        d = json.load(f)
+    m = d.get('trainingEntity', {}).get('checkpointMetrics', {})
+    if m:
+        latest = max(m.keys(), key=int)
+        print(f\"{m[latest]['iteration']}|{m[latest]['metrics']['loss']:.4f}\")
+except: pass
+" 2>/dev/null)
+                if [ -n "$metrics" ]; then
+                    ITER=$(echo "$metrics" | cut -d'|' -f1)
+                    LOSS=$(echo "$metrics" | cut -d'|' -f2)
+                fi
+            fi
+            ;;
+        pytorch)
+            if [ -f "$PYTORCH_LOG" ]; then
+                # Parse PyTorch/YOLO training logs
+                # Supports formats: "Epoch X/Y ... loss: Z" or "iteration: X, loss: Z"
+                local last_line=$(tail -100 "$PYTORCH_LOG" 2>/dev/null | grep -iE "epoch|iter|step|loss" | tail -1)
+                if [ -n "$last_line" ]; then
+                    # Try to extract iteration/epoch
+                    ITER=$(echo "$last_line" | grep -oE "(epoch|iter|step)[^0-9]*[0-9]+" -i | grep -oE "[0-9]+" | tail -1)
+                    # Try to extract loss
+                    LOSS=$(echo "$last_line" | grep -oE "loss[^0-9]*[0-9]+\.?[0-9]*" -i | grep -oE "[0-9]+\.?[0-9]*" | tail -1)
+                fi
+                ITER=${ITER:-0}
+                LOSS=${LOSS:-"--"}
+            fi
+            ;;
+        huggingface)
+            if [ -d "$HF_LOG" ]; then
+                # Parse HuggingFace Trainer state
+                local state_file="$HF_LOG/trainer_state.json"
+                if [ -f "$state_file" ]; then
+                    local hf_data=$(python3 -c "
+import json
+try:
+    with open('$state_file') as f:
+        d = json.load(f)
+    step = d.get('global_step', 0)
+    logs = d.get('log_history', [])
+    loss = '--'
+    for log in reversed(logs):
+        if 'loss' in log:
+            loss = f\"{log['loss']:.4f}\"
+            break
+    print(f'{step}|{loss}')
+except: pass
+" 2>/dev/null)
+                    if [ -n "$hf_data" ]; then
+                        ITER=$(echo "$hf_data" | cut -d'|' -f1)
+                        LOSS=$(echo "$hf_data" | cut -d'|' -f2)
+                    fi
+                fi
+            fi
+            ;;
+        manual)
+            if [ -f "$STATE" ]; then
+                ITER=$(cut -d'|' -f1 < "$STATE" 2>/dev/null || echo 0)
+                LOSS=$(cut -d'|' -f2 < "$STATE" 2>/dev/null || echo "--")
+            fi
+            ;;
+    esac
+
+    ITER=${ITER:-0}; LOSS=${LOSS:-"--"}
+
+    # Best loss tracking
+    if [ "$LOSS" != "--" ] && [ -n "$LOSS" ]; then
+        local best=$(cat "$BEST" 2>/dev/null || echo 999)
+        local cmp=$(awk "BEGIN {print ($LOSS < $best) ? 1 : 0}" 2>/dev/null || echo 0)
+        [ "$cmp" = "1" ] && echo "$LOSS" > "$BEST"
+    fi
+    BEST_L=$(cat "$BEST" 2>/dev/null || echo "--")
+    [ "$BEST_L" = "999" ] && BEST_L="--"
+
+    # Progress calculation
+    PCT=0
+    [ "$ITER" -gt 0 ] 2>/dev/null && PCT=$((ITER * 100 / TOTAL))
+    [ $PCT -gt 100 ] && PCT=100
+
+    # Time calculation
+    local st=$(cat "$START" 2>/dev/null || date +%s)
+    local now=$(date +%s)
+    ELAP=$((now - st))
+    ELAP_S=$(fmt_time $ELAP)
+
+    SPD="--"; ETA_S="--:--:--"
+    if [ "$ITER" -gt 0 ] && [ "$ELAP" -gt 0 ]; then
+        SPD=$(awk "BEGIN {printf \"%.0f\", $ITER * 3600 / $ELAP}")
+        local rem=$((TOTAL - ITER))
+        local eta=$((rem * ELAP / ITER))
+        ETA_S=$(fmt_time $eta)
+    fi
+
+    # GPU Name (cached)
+    if [ -z "$GPU_N" ]; then
+        GPU_N=$(system_profiler SPDisplaysDataType 2>/dev/null | grep "Chipset Model" | cut -d: -f2 | xargs)
+        GPU_N=${GPU_N:-"Apple Silicon GPU"}
+    fi
+
+    # ML Processes
+    PROCS=$(ps aux 2>/dev/null | grep -iE "MLRecipe|Create ML|MTLCompiler|python.*train|torch|tensorflow|jax" | grep -v grep | grep -v mlgpu | head -3)
+}
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# JSON Output
+# ─────────────────────────────────────────────────────────────────────────────────
+output_json() {
+    collect
+    cat << EOF
+{
+  "version": "$VERSION",
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "data_source": "$DATA_SOURCE",
+  "training": {
+    "iteration": $ITER,
+    "total": $TOTAL,
+    "progress_pct": $PCT,
+    "loss": $([ "$LOSS" = "--" ] && echo "null" || echo "$LOSS"),
+    "best_loss": $([ "$BEST_L" = "--" ] && echo "null" || echo "$BEST_L"),
+    "speed_iter_hr": $([ "$SPD" = "--" ] && echo "null" || echo "$SPD"),
+    "elapsed_sec": $ELAP,
+    "eta_sec": $([ "$ETA_S" = "--:--:--" ] && echo "null" || echo "$((TOTAL - ITER))")
+  },
+  "gpu": {
+    "name": "$GPU_N",
+    "device_util": $GPU_D,
+    "renderer_util": $GPU_R,
+    "tiler_util": $GPU_T
+  },
+  "memory": {
+    "used_bytes": $MEM_U,
+    "allocated_bytes": $MEM_A,
+    "used_gb": $MEM_U_GB,
+    "allocated_gb": $MEM_A_GB
+  }
+}
+EOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Display Functions
+# ─────────────────────────────────────────────────────────────────────────────────
+hl() {
+    local c="$1" l="$2" r="$3"
+    echo -n "${c}${l}"
+    printf '─%.0s' $(seq 1 $((W-2)))
+    echo "${r}${RST}"
+}
+
+render() {
+    local BW=46
+
+    tput cup 0 0
+
+    # Header
+    echo ""
+    echo "${BLD}${BGBLU}${BWHT}  ⬢ mlgpu - ML Training Monitor                             $(date '+%Y-%m-%d %H:%M:%S')  ${RST}"
+    echo ""
+
+    # TRAINING
+    hl "${BLD}${BCYN}" "╭" "╮"
+    echo "${BLD}${BCYN}│${RST} ${BLD}${BWHT}⚡ TRAINING${RST}                                                                  ${BLD}${BCYN}│${RST}"
+    hl "${BLD}${BCYN}" "├" "┤"
+
+    local tb=$(bar $PCT $BW train)
+    local pc="${BCYN}"; [ $PCT -ge 50 ] && pc="${BGRN}"; [ $PCT -ge 90 ] && pc="${BLD}${BGRN}"
+    printf "${BLD}${BCYN}│${RST}  Progress   %s %s%3d%%${RST}        ${BLD}${BCYN}│${RST}\n" "$tb" "$pc" "$PCT"
+
+    hl "${BLD}${BCYN}" "├" "┤"
+
+    local lc="${BBLK}"
+    if [ "$LOSS" != "--" ] && [ -n "$LOSS" ]; then
+        local lv=$(echo "$LOSS" | cut -d. -f1)
+        [ "$lv" -lt 5 ] 2>/dev/null && lc="${BGRN}"
+        [ "$lv" -ge 5 ] 2>/dev/null && [ "$lv" -lt 10 ] 2>/dev/null && lc="${BYEL}"
+        [ "$lv" -ge 10 ] 2>/dev/null && lc="${BRED}"
+    fi
+
+    printf "${BLD}${BCYN}│${RST}  ${BWHT}Iteration${RST} ${BGRN}%-15s${RST}${BWHT}Loss${RST} %s%-11s${RST}${BWHT}Elapsed${RST} ${BCYN}%-10s${RST}${BLD}${BCYN}│${RST}\n" \
+        "$ITER/$TOTAL" "$lc" "$LOSS" "$ELAP_S"
+
+    printf "${BLD}${BCYN}│${RST}  ${BWHT}Speed${RST}     ${BMAG}%-15s${RST}${BWHT}Best${RST} ${BGRN}%-11s${RST}${BWHT}ETA${RST}     ${BYEL}%-10s${RST}${BLD}${BCYN}│${RST}\n" \
+        "$SPD it/hr" "$BEST_L" "$ETA_S"
+
+    if [ "$LOSS" != "--" ] && [ -n "$LOSS" ]; then
+        hl "${BLD}${BCYN}" "├" "┤"
+        local lpct=$(awk "BEGIN {v=$LOSS*5; if(v>100)v=100; printf \"%.0f\", v}" 2>/dev/null || echo 50)
+        local lb=$(bar $lpct $BW loss)
+        printf "${BLD}${BCYN}│${RST}  Loss Trend %s ${BBLK}(lower=better)${RST}     ${BLD}${BCYN}│${RST}\n" "$lb"
+    fi
+
+    hl "${BLD}${BCYN}" "╰" "╯"
+    echo ""
+
+    # GPU
+    hl "${BLD}${BGRN}" "╭" "╮"
+    printf "${BLD}${BGRN}│${RST} ${BLD}${BWHT}🖥  GPU${RST}  ${DIM}%-60s${RST}${BLD}${BGRN}│${RST}\n" "$GPU_N"
+    hl "${BLD}${BGRN}" "├" "┤"
+
+    local db=$(bar $GPU_D $BW gpu); local dc=$(pct_c $GPU_D)
+    printf "${BLD}${BGRN}│${RST}  Device    %s %s%3d%%${RST}        ${BLD}${BGRN}│${RST}\n" "$db" "$dc" "$GPU_D"
+
+    local rb=$(bar $GPU_R $BW gpu); local rc=$(pct_c $GPU_R)
+    printf "${BLD}${BGRN}│${RST}  Renderer  %s %s%3d%%${RST}        ${BLD}${BGRN}│${RST}\n" "$rb" "$rc" "$GPU_R"
+
+    local tlb=$(bar $GPU_T $BW gpu); local tlc=$(pct_c $GPU_T)
+    printf "${BLD}${BGRN}│${RST}  Tiler     %s %s%3d%%${RST}        ${BLD}${BGRN}│${RST}\n" "$tlb" "$tlc" "$GPU_T"
+
+    hl "${BLD}${BGRN}" "╰" "╯"
+    echo ""
+
+    # MEMORY
+    hl "${BLD}${BMAG}" "╭" "╮"
+    echo "${BLD}${BMAG}│${RST} ${BLD}${BWHT}💾 MEMORY${RST}                                                                   ${BLD}${BMAG}│${RST}"
+    hl "${BLD}${BMAG}" "├" "┤"
+
+    local mpct=$((MEM_U_I * 100 / MEM_A_I))
+    local ub=$(bar $mpct $BW mem)
+    printf "${BLD}${BMAG}│${RST}  In Use    %s ${BCYN}%6.2f GB${RST}   ${BLD}${BMAG}│${RST}\n" "$ub" "$MEM_U_GB"
+
+    local apct=$((MEM_A_I * 100 / 16)); [ $apct -gt 100 ] && apct=100
+    local ab=$(bar $apct $BW mem)
+    printf "${BLD}${BMAG}│${RST}  Allocated %s ${BCYN}%6.2f GB${RST}   ${BLD}${BMAG}│${RST}\n" "$ab" "$MEM_A_GB"
+
+    hl "${BLD}${BMAG}" "╰" "╯"
+    echo ""
+
+    # PROCESSES
+    hl "${BLD}${BYEL}" "╭" "╮"
+    echo "${BLD}${BYEL}│${RST} ${BLD}${BWHT}📊 PROCESSES${RST}                                                                ${BLD}${BYEL}│${RST}"
+    hl "${BLD}${BYEL}" "├" "┤"
+    printf "${BLD}${BYEL}│${RST}  ${DIM}%-7s %-7s %-6s %-50s${RST}${BLD}${BYEL}│${RST}\n" "PID" "CPU%" "MEM%" "COMMAND"
+    hl "${BLD}${BYEL}" "├" "┤"
+
+    if [ -n "$PROCS" ]; then
+        echo "$PROCS" | head -3 | while IFS= read -r line; do
+            local pid=$(echo "$line" | awk '{print $2}')
+            local cpu=$(echo "$line" | awk '{print $3}')
+            local mem=$(echo "$line" | awk '{print $4}')
+            local cmd=$(echo "$line" | awk '{for(i=11;i<=NF;i++) printf $i" "}' | cut -c1-48)
+            printf "${BLD}${BYEL}│${RST}  ${BGRN}%-7s${RST} ${BCYN}%-7s${RST} ${BMAG}%-6s${RST} %-50s${BLD}${BYEL}│${RST}\n" "$pid" "$cpu" "$mem" "$cmd"
+        done
+    else
+        printf "${BLD}${BYEL}│${RST}  ${DIM}%-70s${RST}${BLD}${BYEL}│${RST}\n" "No ML processes detected"
+    fi
+
+    hl "${BLD}${BYEL}" "╰" "╯"
+    echo ""
+
+    # Footer
+    local src_label=""
+    case $DATA_SOURCE in
+        createml) src_label="${BGRN}● LIVE${RST}${DIM} Create ML" ;;
+        pytorch) src_label="${BGRN}● LIVE${RST}${DIM} PyTorch" ;;
+        huggingface) src_label="${BGRN}● LIVE${RST}${DIM} HuggingFace" ;;
+        manual) src_label="${BYEL}● MANUAL${RST}" ;;
+    esac
+    echo "${DIM}  ${src_label}${RST}${DIM}  │  ${BLD}Ctrl+C${RST}${DIM} Exit  │  ${BLD}--json${RST}${DIM} API  │  ${BLD}-h${RST}${DIM} Help  │  v${VERSION}${RST}"
+
+    tput ed
+}
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────────
+if [ "$JSON_MODE" = true ]; then
+    output_json
+    exit 0
+fi
+
+if [ "$ONCE_MODE" = true ]; then
+    collect
+    clear
+    render
+    exit 0
+fi
+
+clear
+while true; do
+    collect
+    render
+    sleep 1
+done
