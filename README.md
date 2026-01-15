@@ -4,7 +4,7 @@
 
 A lightweight, htop-style CLI tool that monitors GPU utilization and ML training progress on Apple Silicon Macs. Unlike general-purpose monitors, mlgpu is specifically designed for machine learning workflows.
 
-![mlgpu screenshot](docs/screenshot.png)
+![mlgpu - Apple Silicon GPU Monitor for ML Training](docs/screenshot.png)
 
 ## Features
 
