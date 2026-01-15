@@ -211,6 +211,65 @@ Top ML-related processes by CPU usage.
 | ETA Calculation | ✅ | ❌ | ❌ | ❌ |
 | Loss Tracking | ✅ | ❌ | ❌ | ❌ |
 
+---
+
+## Bonus Tool: coreml2onnx
+
+This repo also includes a **CoreML to ONNX converter** for cross-platform deployment.
+
+### Installation
+
+```bash
+pip install coremltools onnxmltools onnx onnxruntime
+```
+
+### Usage
+
+```bash
+# Basic conversion
+./tools/coreml2onnx model.mlmodel
+
+# Specify output path
+./tools/coreml2onnx model.mlmodel -o output.onnx
+
+# Convert and validate
+./tools/coreml2onnx model.mlpackage --validate --test
+
+# Show model info only
+./tools/coreml2onnx model.mlmodel --info
+```
+
+### Options
+
+| Flag | Description |
+|------|-------------|
+| `-o, --output` | Output ONNX file path |
+| `--opset` | ONNX opset version (default: 13) |
+| `--validate` | Validate converted model |
+| `--test` | Test inference with ONNX Runtime |
+| `--info` | Show model info and exit |
+| `-q, --quiet` | Suppress banner |
+
+### Limitations
+
+**Important:** Create ML Object Detection models may not convert cleanly to ONNX due to Apple's proprietary architecture. For reliable cross-platform ONNX models, consider:
+
+1. Training with **Ultralytics/PyTorch** and exporting directly:
+   ```python
+   from ultralytics import YOLO
+   model = YOLO("best.pt")
+   model.export(format="onnx")
+   ```
+
+2. Using the CoreML model directly on **Apple devices**
+
+The converter works best with:
+- Neural Network classifiers/regressors
+- Simple pipeline models
+- Models originally converted FROM ONNX
+
+---
+
 ## Troubleshooting
 
 ### "No ML processes detected"

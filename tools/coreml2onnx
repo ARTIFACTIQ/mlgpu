@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""
+coreml2onnx - Convert CoreML models to ONNX format
+
+Supports:
+- .mlmodel files (legacy CoreML format)
+- .mlpackage directories (modern ML Program format)
+
+Note: Create ML Object Detection models may not convert cleanly due to
+Apple's proprietary architecture. For reliable ONNX export, consider
+training with Ultralytics/PyTorch instead.
+
+Usage:
+    coreml2onnx model.mlmodel                    # Convert to model.onnx
+    coreml2onnx model.mlmodel -o output.onnx    # Specify output path
+    coreml2onnx model.mlpackage --validate      # Convert and validate
+
+Requirements:
+    pip install coremltools onnxmltools onnx onnxruntime
+
+Author: Artifactiq (https://github.com/ARTIFACTIQ/mlgpu)
+License: MIT
+"""
+
+import argparse
+import sys
+import os
+from pathlib import Path
+
+# Version
+__version__ = "1.0.0"
+
+# Colors for terminal output
+class Colors:
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+
+def print_banner():
+    print(f"""
+{Colors.CYAN}╔═══════════════════════════════════════════════════╗
+║  coreml2onnx - CoreML to ONNX Converter           ║
+║  https://github.com/ARTIFACTIQ/mlgpu              ║
+╚═══════════════════════════════════════════════════╝{Colors.RESET}
+""")
+
+def check_dependencies():
+    """Check if required packages are installed."""
+    missing = []
+
+    try:
+        import coremltools
+    except ImportError:
+        missing.append("coremltools")
+
+    try:
+        import onnxmltools
+    except ImportError:
+        missing.append("onnxmltools")
+
+    try:
+        import onnx
+    except ImportError:
+        missing.append("onnx")
+
+    if missing:
+        print(f"{Colors.RED}Error: Missing required packages: {', '.join(missing)}{Colors.RESET}")
+        print(f"\nInstall with:")
+        print(f"  pip install {' '.join(missing)}")
+        sys.exit(1)
+
+    return True
+
+def get_model_info(model_path: Path) -> dict:
+    """Get information about the CoreML model."""
+    import coremltools as ct
+
+    info = {
+        "path": str(model_path),
+        "format": "mlpackage" if model_path.suffix == ".mlpackage" else "mlmodel",
+        "type": "unknown",
+        "inputs": [],
+        "outputs": [],
+    }
+
+    try:
+        if model_path.suffix == ".mlpackage":
+            model = ct.models.MLModel(str(model_path))
+        else:
+            model = ct.models.MLModel(str(model_path))
+
+        spec = model.get_spec()
+
+        # Determine model type
+        if spec.HasField('neuralNetwork'):
+            info["type"] = "Neural Network"
+        elif spec.HasField('neuralNetworkClassifier'):
+            info["type"] = "Neural Network Classifier"
+        elif spec.HasField('neuralNetworkRegressor'):
+            info["type"] = "Neural Network Regressor"
+        elif spec.HasField('pipeline'):
+            info["type"] = "Pipeline"
+        elif spec.HasField('mlProgram'):
+            info["type"] = "ML Program"
+
+        # Get inputs
+        for inp in spec.description.input:
+            input_info = {"name": inp.name}
+            if inp.type.HasField('imageType'):
+                input_info["type"] = "image"
+                input_info["width"] = inp.type.imageType.width
+                input_info["height"] = inp.type.imageType.height
+            elif inp.type.HasField('multiArrayType'):
+                input_info["type"] = "array"
+                input_info["shape"] = list(inp.type.multiArrayType.shape)
+            info["inputs"].append(input_info)
+
+        # Get outputs
+        for out in spec.description.output:
+            output_info = {"name": out.name}
+            if out.type.HasField('multiArrayType'):
+                output_info["type"] = "array"
+            elif out.type.HasField('dictionaryType'):
+                output_info["type"] = "dictionary"
+            info["outputs"].append(output_info)
+
+        info["spec"] = spec
+        info["model"] = model
+
+    except Exception as e:
+        info["error"] = str(e)
+
+    return info
+
+def convert_coreml_to_onnx(model_path: Path, output_path: Path, opset_version: int = 13) -> bool:
+    """Convert CoreML model to ONNX format."""
+    import coremltools as ct
+    import onnxmltools
+    from onnxmltools.utils import save_model
+
+    print(f"{Colors.BLUE}Loading CoreML model...{Colors.RESET}")
+
+    try:
+        # Load the model
+        if model_path.suffix == ".mlpackage":
+            model = ct.models.MLModel(str(model_path))
+            spec = model.get_spec()
+        else:
+            spec = ct.utils.load_spec(str(model_path))
+
+        print(f"  Model loaded successfully")
+
+    except Exception as e:
+        print(f"{Colors.RED}Error loading model: {e}{Colors.RESET}")
+        return False
+
+    print(f"{Colors.BLUE}Converting to ONNX (opset {opset_version})...{Colors.RESET}")
+
+    try:
+        # Convert to ONNX
+        onnx_model = onnxmltools.convert_coreml(
+            spec,
+            target_opset=opset_version,
+            name=model_path.stem
+        )
+
+        print(f"  Conversion successful")
+
+    except Exception as e:
+        error_msg = str(e)
+        print(f"{Colors.RED}Error during conversion: {e}{Colors.RESET}")
+
+        # Provide helpful guidance based on error
+        if "not supported" in error_msg.lower():
+            print(f"\n{Colors.YELLOW}This model uses operators not supported by ONNX.{Colors.RESET}")
+            print("Create ML Object Detection models often have this issue.")
+            print("\nAlternatives:")
+            print("  1. Use the model directly with CoreML on Apple devices")
+            print("  2. Train with Ultralytics/PyTorch for native ONNX export:")
+            print("     yolo export model=best.pt format=onnx")
+
+        return False
+
+    print(f"{Colors.BLUE}Saving ONNX model...{Colors.RESET}")
+
+    try:
+        save_model(onnx_model, str(output_path))
+        print(f"  Saved to: {output_path}")
+
+    except Exception as e:
+        print(f"{Colors.RED}Error saving model: {e}{Colors.RESET}")
+        return False
+
+    return True
+
+def validate_onnx_model(onnx_path: Path) -> bool:
+    """Validate the ONNX model."""
+    import onnx
+
+    print(f"{Colors.BLUE}Validating ONNX model...{Colors.RESET}")
+
+    try:
+        model = onnx.load(str(onnx_path))
+        onnx.checker.check_model(model)
+        print(f"  {Colors.GREEN}Model is valid{Colors.RESET}")
+
+        # Print model info
+        print(f"\n{Colors.CYAN}ONNX Model Info:{Colors.RESET}")
+        print(f"  IR Version: {model.ir_version}")
+        print(f"  Opset Version: {model.opset_import[0].version}")
+        print(f"  Producer: {model.producer_name} {model.producer_version}")
+
+        # Inputs
+        print(f"\n  Inputs:")
+        for inp in model.graph.input:
+            shape = [d.dim_value or d.dim_param for d in inp.type.tensor_type.shape.dim]
+            print(f"    - {inp.name}: {shape}")
+
+        # Outputs
+        print(f"\n  Outputs:")
+        for out in model.graph.output:
+            shape = [d.dim_value or d.dim_param for d in out.type.tensor_type.shape.dim]
+            print(f"    - {out.name}: {shape}")
+
+        return True
+
+    except Exception as e:
+        print(f"  {Colors.RED}Validation failed: {e}{Colors.RESET}")
+        return False
+
+def test_inference(onnx_path: Path) -> bool:
+    """Test inference with ONNX Runtime."""
+    try:
+        import onnxruntime as ort
+        import numpy as np
+    except ImportError:
+        print(f"{Colors.YELLOW}Skipping inference test (onnxruntime not installed){Colors.RESET}")
+        return True
+
+    print(f"{Colors.BLUE}Testing inference with ONNX Runtime...{Colors.RESET}")
+
+    try:
+        session = ort.InferenceSession(str(onnx_path))
+
+        # Get input details
+        inputs = session.get_inputs()
+        input_feed = {}
+
+        for inp in inputs:
+            shape = inp.shape
+            # Replace dynamic dimensions with reasonable values
+            shape = [s if isinstance(s, int) and s > 0 else 1 for s in shape]
+
+            # Handle image inputs (typically 3 or 4 dims)
+            if len(shape) >= 3:
+                # Assume NCHW or NHWC format
+                if shape[-1] == 3 or shape[1] == 3:
+                    # Use 640x640 for object detection models
+                    if len(shape) == 4:
+                        shape = [1, 3, 640, 640] if shape[1] == 3 else [1, 640, 640, 3]
+                    elif len(shape) == 3:
+                        shape = [3, 640, 640] if shape[0] == 3 else [640, 640, 3]
+
+            dtype = np.float32
+            if 'int' in inp.type.lower():
+                dtype = np.int64
+
+            input_feed[inp.name] = np.random.randn(*shape).astype(dtype)
+
+        # Run inference
+        outputs = session.run(None, input_feed)
+
+        print(f"  {Colors.GREEN}Inference successful{Colors.RESET}")
+        print(f"  Output shapes: {[o.shape for o in outputs]}")
+
+        return True
+
+    except Exception as e:
+        print(f"  {Colors.RED}Inference failed: {e}{Colors.RESET}")
+        return False
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Convert CoreML models to ONNX format",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s model.mlmodel                    Convert to model.onnx
+  %(prog)s model.mlmodel -o output.onnx     Specify output path
+  %(prog)s model.mlpackage --validate       Convert and validate
+  %(prog)s model.mlmodel --info             Show model info only
+
+Note: Create ML Object Detection models may not convert cleanly.
+For reliable ONNX export, train with Ultralytics/PyTorch instead.
+        """
+    )
+
+    parser.add_argument("model", help="Path to CoreML model (.mlmodel or .mlpackage)")
+    parser.add_argument("-o", "--output", help="Output ONNX file path")
+    parser.add_argument("--opset", type=int, default=13, help="ONNX opset version (default: 13)")
+    parser.add_argument("--validate", action="store_true", help="Validate the converted model")
+    parser.add_argument("--test", action="store_true", help="Test inference with ONNX Runtime")
+    parser.add_argument("--info", action="store_true", help="Show model info and exit")
+    parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Suppress banner")
+
+    args = parser.parse_args()
+
+    if not args.quiet:
+        print_banner()
+
+    # Check dependencies
+    check_dependencies()
+
+    # Validate input path
+    model_path = Path(args.model)
+    if not model_path.exists():
+        print(f"{Colors.RED}Error: Model not found: {model_path}{Colors.RESET}")
+        sys.exit(1)
+
+    # Get model info
+    info = get_model_info(model_path)
+
+    if "error" in info:
+        print(f"{Colors.RED}Error reading model: {info['error']}{Colors.RESET}")
+        sys.exit(1)
+
+    # Display model info
+    print(f"{Colors.CYAN}CoreML Model Info:{Colors.RESET}")
+    print(f"  Path: {info['path']}")
+    print(f"  Format: {info['format']}")
+    print(f"  Type: {info['type']}")
+    print(f"  Inputs: {len(info['inputs'])}")
+    for inp in info['inputs']:
+        print(f"    - {inp['name']}: {inp.get('type', 'unknown')}")
+    print(f"  Outputs: {len(info['outputs'])}")
+    for out in info['outputs']:
+        print(f"    - {out['name']}: {out.get('type', 'unknown')}")
+    print()
+
+    # Check for potential issues
+    if info['type'] == 'ML Program':
+        print(f"{Colors.YELLOW}Warning: ML Program format detected.{Colors.RESET}")
+        print("This newer format may have limited ONNX conversion support.\n")
+
+    if args.info:
+        sys.exit(0)
+
+    # Determine output path
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        output_path = model_path.with_suffix(".onnx")
+
+    # Convert
+    success = convert_coreml_to_onnx(model_path, output_path, args.opset)
+
+    if not success:
+        sys.exit(1)
+
+    # Validate
+    if args.validate or args.test:
+        print()
+        if not validate_onnx_model(output_path):
+            sys.exit(1)
+
+    # Test inference
+    if args.test:
+        print()
+        test_inference(output_path)
+
+    # Summary
+    print(f"\n{Colors.GREEN}✓ Conversion complete!{Colors.RESET}")
+    print(f"  Output: {output_path}")
+    print(f"  Size: {output_path.stat().st_size / 1024 / 1024:.1f} MB")
+
+if __name__ == "__main__":
+    main()
